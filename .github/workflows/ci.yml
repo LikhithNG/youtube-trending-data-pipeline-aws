@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements-dev.txt
+      - run: python -m compileall lambdas data_quality glue_jobs scripts
+      - run: ruff check lambdas data_quality scripts tests
+      - run: pytest -q
+      - name: Render Step Functions example
+        run: |
+          python scripts/render_state_machine.py \
+            --template step_functions/pipeline_orchestration.template.json \
+            --config step_functions/config.example.json \
+            --output /tmp/pipeline-orchestration.json
+          python -m json.tool /tmp/pipeline-orchestration.json >/dev/null

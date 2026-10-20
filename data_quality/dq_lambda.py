@@ -12,17 +12,17 @@ Checks performed:
   5. Freshness — is the data recent enough?
 
 Environment Variables:
-    S3_BUCKET_SILVER        — Silver bucket to check
     SNS_ALERT_TOPIC_ARN     — SNS for alerts
+    ATHENA_WORKGROUP        — Athena workgroup used for validation queries
 """
 
-import os
 import json
 import logging
-from datetime import datetime, timezone, timedelta
+import os
+from datetime import UTC, datetime, timedelta
 
-import boto3
 import awswrangler as wr
+import boto3
 import pandas as pd
 
 logger = logging.getLogger()
@@ -30,6 +30,7 @@ logger.setLevel(logging.INFO)
 
 sns_client = boto3.client("sns")
 SNS_TOPIC = os.environ.get("SNS_ALERT_TOPIC_ARN", "")
+ATHENA_WORKGROUP = os.environ.get("ATHENA_WORKGROUP", "primary")
 
 # ── Thresholds ───────────────────────────────────────────────────────────────
 MIN_ROW_COUNT = int(os.environ.get("DQ_MIN_ROW_COUNT", "10"))
@@ -65,26 +66,30 @@ def check_null_percentage(df: pd.DataFrame, table_name: str) -> list:
 
     for col in cols:
         if col not in df.columns:
-            results.append({
-                "check": "null_pct",
-                "table": table_name,
-                "column": col,
-                "passed": False,
-                "message": f"Column '{col}' missing from table",
-            })
+            results.append(
+                {
+                    "check": "null_pct",
+                    "table": table_name,
+                    "column": col,
+                    "passed": False,
+                    "message": f"Column '{col}' missing from table",
+                }
+            )
             continue
 
         null_pct = (df[col].isna().sum() / len(df)) * 100 if len(df) > 0 else 0
         passed = null_pct <= MAX_NULL_PCT
-        results.append({
-            "check": "null_pct",
-            "table": table_name,
-            "column": col,
-            "value": round(null_pct, 2),
-            "threshold": MAX_NULL_PCT,
-            "passed": passed,
-            "message": f"{col} null%: {null_pct:.2f}% (max: {MAX_NULL_PCT}%)",
-        })
+        results.append(
+            {
+                "check": "null_pct",
+                "table": table_name,
+                "column": col,
+                "value": round(null_pct, 2),
+                "threshold": MAX_NULL_PCT,
+                "passed": passed,
+                "message": f"{col} null%: {null_pct:.2f}% (max: {MAX_NULL_PCT}%)",
+            }
+        )
 
     return results
 
@@ -115,15 +120,17 @@ def check_value_ranges(df: pd.DataFrame, table_name: str) -> list:
         negative = (df["views"] < 0).sum()
         extreme = (df["views"] > MAX_VIEWS).sum()
         passed = negative == 0 and extreme == 0
-        results.append({
-            "check": "value_range",
-            "table": table_name,
-            "column": "views",
-            "negative_count": int(negative),
-            "extreme_count": int(extreme),
-            "passed": passed,
-            "message": f"Views: {negative} negative, {extreme} extreme (>{MAX_VIEWS})",
-        })
+        results.append(
+            {
+                "check": "value_range",
+                "table": table_name,
+                "column": "views",
+                "negative_count": int(negative),
+                "extreme_count": int(extreme),
+                "passed": passed,
+                "message": f"Views: {negative} negative, {extreme} extreme (>{MAX_VIEWS})",
+            }
+        )
 
     return results
 
@@ -134,17 +141,16 @@ def check_freshness(df: pd.DataFrame, table_name: str) -> dict:
         return {
             "check": "freshness",
             "table": table_name,
-            "passed": True,
-            "message": "No timestamp column found — skipping freshness check (backfill data)",
+            "passed": False,
+            "message": "No supported timestamp column found",
         }
 
     ts_col = "_processed_at" if "_processed_at" in df.columns else "_ingestion_timestamp"
     try:
-        latest = pd.to_datetime(df[ts_col]).max()
-        cutoff = datetime.now(timezone.utc) - timedelta(hours=FRESHNESS_HOURS)
-        # Handle timezone-naive timestamps
-        if latest.tzinfo is None:
-            latest = latest.replace(tzinfo=timezone.utc)
+        latest = pd.to_datetime(df[ts_col], errors="coerce", utc=True).max()
+        if pd.isna(latest):
+            raise ValueError(f"Column {ts_col} contains no valid timestamps")
+        cutoff = datetime.now(UTC) - timedelta(hours=FRESHNESS_HOURS)
         passed = latest >= cutoff
         return {
             "check": "freshness",
@@ -154,12 +160,12 @@ def check_freshness(df: pd.DataFrame, table_name: str) -> dict:
             "passed": passed,
             "message": f"Latest: {latest}, Cutoff: {cutoff}",
         }
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - invalid third-party timestamp values vary
         return {
             "check": "freshness",
             "table": table_name,
-            "passed": True,
-            "message": f"Could not parse timestamps: {e} — skipping",
+            "passed": False,
+            "message": f"Could not validate timestamps: {e}",
         }
 
 
@@ -190,15 +196,18 @@ def lambda_handler(event, context):
                 sql=query,
                 database=database,
                 ctas_approach=False,
+                workgroup=ATHENA_WORKGROUP,
             )
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - surface any Athena/SDK read failure as DQ
             logger.error(f"Could not read {table_name}: {e}")
-            all_results.append({
-                "check": "read_table",
-                "table": table_name,
-                "passed": False,
-                "message": str(e),
-            })
+            all_results.append(
+                {
+                    "check": "read_table",
+                    "table": table_name,
+                    "passed": False,
+                    "message": str(e),
+                }
+            )
             overall_passed = False
             continue
 
@@ -211,7 +220,9 @@ def lambda_handler(event, context):
         checks.append(check_freshness(df, table_name))
 
         for check in checks:
-            logger.info(f"  {check['check']}: {'PASS' if check['passed'] else 'FAIL'} — {check['message']}")
+            logger.info(
+                f"  {check['check']}: {'PASS' if check['passed'] else 'FAIL'} — {check['message']}"
+            )
             if not check["passed"]:
                 overall_passed = False
 
@@ -220,7 +231,10 @@ def lambda_handler(event, context):
     # Summary
     passed_count = sum(1 for r in all_results if r["passed"])
     total_count = len(all_results)
-    logger.info(f"DQ Summary: {passed_count}/{total_count} checks passed. Overall: {'PASS' if overall_passed else 'FAIL'}")
+    overall_status = "PASS" if overall_passed else "FAIL"
+    logger.info(
+        f"DQ Summary: {passed_count}/{total_count} checks passed. Overall: {overall_status}"
+    )
 
     if not overall_passed and SNS_TOPIC:
         failed = [r for r in all_results if not r["passed"]]

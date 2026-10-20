@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+dist/
+build/
+*.zip
+.env
+step_functions/pipeline-orchestration.json
+step_functions/config.dev.json
+step_functions/config.prod.json

@@ -1,0 +1,23 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "PipelineBuckets",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket"],
+      "Resource": ["arn:aws:s3:::${BUCKET_PREFIX}-*", "arn:aws:s3:::${BUCKET_PREFIX}-*/*"]
+    },
+    {
+      "Sid": "GlueCatalog",
+      "Effect": "Allow",
+      "Action": ["glue:GetDatabase", "glue:GetDatabases", "glue:GetTable", "glue:GetTables", "glue:GetPartitions", "glue:CreateTable", "glue:UpdateTable", "glue:CreatePartition", "glue:BatchCreatePartition", "glue:BatchUpdatePartition"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "JobLogs",
+      "Effect": "Allow",
+      "Action": ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents", "cloudwatch:PutMetricData"],
+      "Resource": "*"
+    }
+  ]
+}

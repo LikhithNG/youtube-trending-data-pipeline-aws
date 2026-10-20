@@ -1,0 +1,145 @@
+{
+  "Comment": "Portable YouTube Data Pipeline orchestration template",
+  "StartAt": "IngestFromYouTubeAPI",
+  "States": {
+    "IngestFromYouTubeAPI": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${INGESTION_LAMBDA_ARN}",
+        "Payload": {
+          "triggered_by": "step_functions",
+          "execution_id.$": "$$.Execution.Id"
+        }
+      },
+      "ResultPath": "$.ingestion_result",
+      "Retry": [{
+        "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+        "IntervalSeconds": 15,
+        "MaxAttempts": 3,
+        "BackoffRate": 2
+      }],
+      "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "NotifyIngestionFailure"}],
+      "Next": "ProcessSilverInParallel"
+    },
+    "ProcessSilverInParallel": {
+      "Type": "Parallel",
+      "Branches": [
+        {
+          "StartAt": "TransformReferenceData",
+          "States": {
+            "TransformReferenceData": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${REFERENCE_LAMBDA_ARN}",
+                "Payload": {
+                  "objects.$": "$.ingestion_result.Payload.reference_objects"
+                }
+              },
+              "Retry": [{"ErrorEquals": ["States.ALL"], "IntervalSeconds": 15, "MaxAttempts": 3, "BackoffRate": 2}],
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "RunBronzeToSilverGlueJob",
+          "States": {
+            "RunBronzeToSilverGlueJob": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::glue:startJobRun.sync",
+              "Parameters": {
+                "JobName": "${BRONZE_TO_SILVER_JOB}",
+                "Arguments": {
+                  "--bronze_database": "${BRONZE_DATABASE}",
+                  "--bronze_table": "${BRONZE_TABLE}",
+                  "--silver_bucket": "${SILVER_BUCKET}",
+                  "--silver_database": "${SILVER_DATABASE}",
+                  "--silver_table": "${SILVER_TABLE}"
+                }
+              },
+              "Retry": [{"ErrorEquals": ["States.ALL"], "IntervalSeconds": 60, "MaxAttempts": 3, "BackoffRate": 2}],
+              "End": true
+            }
+          }
+        }
+      ],
+      "ResultPath": "$.silver_results",
+      "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "NotifyTransformFailure"}],
+      "Next": "RunDataQualityChecks"
+    },
+    "RunDataQualityChecks": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${DATA_QUALITY_LAMBDA_ARN}",
+        "Payload": {
+          "database": "${SILVER_DATABASE}",
+          "tables": ["${SILVER_TABLE}", "${REFERENCE_TABLE}"]
+        }
+      },
+      "ResultPath": "$.dq_result",
+      "Retry": [{"ErrorEquals": ["States.ALL"], "IntervalSeconds": 15, "MaxAttempts": 3, "BackoffRate": 2}],
+      "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "NotifyDQFailure"}],
+      "Next": "EvaluateDataQuality"
+    },
+    "EvaluateDataQuality": {
+      "Type": "Choice",
+      "Choices": [{
+        "Variable": "$.dq_result.Payload.quality_passed",
+        "BooleanEquals": true,
+        "Next": "RunSilverToGoldGlueJob"
+      }],
+      "Default": "NotifyDQFailure"
+    },
+    "RunSilverToGoldGlueJob": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "${SILVER_TO_GOLD_JOB}",
+        "Arguments": {
+          "--silver_database": "${SILVER_DATABASE}",
+          "--gold_bucket": "${GOLD_BUCKET}",
+          "--gold_database": "${GOLD_DATABASE}"
+        }
+      },
+      "Retry": [{"ErrorEquals": ["States.ALL"], "IntervalSeconds": 60, "MaxAttempts": 3, "BackoffRate": 2}],
+      "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "NotifyGoldFailure"}],
+      "Next": "NotifySuccess"
+    },
+    "NotifySuccess": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${SNS_TOPIC_ARN}",
+        "Subject": "[YT Pipeline] Pipeline completed successfully",
+        "Message.$": "States.Format('Pipeline run {} completed. All layers updated.', $$.Execution.Id)"
+      },
+      "End": true
+    },
+    "NotifyIngestionFailure": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {"TopicArn": "${SNS_TOPIC_ARN}", "Subject": "[YT Pipeline] FAILURE - ingestion", "Message.$": "States.JsonToString($.error)"},
+      "End": true
+    },
+    "NotifyTransformFailure": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {"TopicArn": "${SNS_TOPIC_ARN}", "Subject": "[YT Pipeline] FAILURE - Silver transform", "Message.$": "States.JsonToString($.error)"},
+      "End": true
+    },
+    "NotifyDQFailure": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {"TopicArn": "${SNS_TOPIC_ARN}", "Subject": "[YT Pipeline] FAILURE - data quality", "Message.$": "States.JsonToString($)"},
+      "End": true
+    },
+    "NotifyGoldFailure": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {"TopicArn": "${SNS_TOPIC_ARN}", "Subject": "[YT Pipeline] FAILURE - Gold aggregation", "Message.$": "States.JsonToString($.error)"},
+      "End": true
+    }
+  }
+}

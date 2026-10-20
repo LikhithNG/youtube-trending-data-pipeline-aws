@@ -1,173 +1,121 @@
-"""
-Lambda: JSON Reference Data → Silver Layer (Parquet)
-────────────────────────────────────────────────────
-Triggered by S3 event when new JSON lands in the Bronze bucket
-under the reference_data prefix.
-
-Improvements over original:
-  - Data validation before writing
-  - Deduplication of category records
-  - Proper error handling with dead-letter alerting
-  - Idempotent writes (overwrites partition, not append)
-  - Structured logging
-
-Environment Variables:
-    S3_BUCKET_SILVER            — Target bucket for cleansed data
-    GLUE_DB_SILVER              — Glue catalog database name
-    GLUE_TABLE_REFERENCE        — Glue catalog table name
-    SNS_ALERT_TOPIC_ARN         — SNS topic for alerts (optional)
-"""
+"""Normalize YouTube category JSON and write partitioned Silver Parquet."""
 
 import json
-import os
 import logging
-from datetime import datetime, timezone
+import os
+from datetime import UTC, datetime
 from urllib.parse import unquote_plus
 
-import boto3
 import awswrangler as wr
+import boto3
 import pandas as pd
 
-# ── Logging ──────────────────────────────────────────────────────────────────
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
-
-# ── Config ───────────────────────────────────────────────────────────────────
-SILVER_BUCKET = os.environ["S3_BUCKET_SILVER"]
-GLUE_DB = os.environ.get("GLUE_DB_SILVER", "yt_pipeline_silver_dev")
-GLUE_TABLE = os.environ.get("GLUE_TABLE_REFERENCE", "clean_reference_data")
-SNS_TOPIC = os.environ.get("SNS_ALERT_TOPIC_ARN", "")
-SILVER_PATH = f"s3://{SILVER_BUCKET}/youtube/reference_data/"
-
 s3_client = boto3.client("s3")
 sns_client = boto3.client("sns")
 
 
+def config() -> dict:
+    bucket = os.environ["S3_BUCKET_SILVER"]
+    return {
+        "path": f"s3://{bucket}/youtube/reference_data/",
+        "database": os.getenv("GLUE_DB_SILVER", "yt_pipeline_silver_dev"),
+        "table": os.getenv("GLUE_TABLE_REFERENCE", "clean_reference_data"),
+        "sns_topic": os.getenv("SNS_ALERT_TOPIC_ARN", ""),
+    }
+
+
+def extract_objects(event: dict) -> list[dict]:
+    """Accept native S3 notifications or the explicit object list from Step Functions."""
+    objects = []
+    for item in event.get("objects", []):
+        if item.get("bucket") and item.get("key"):
+            objects.append({"bucket": item["bucket"], "key": unquote_plus(item["key"])})
+
+    records = event.get("Records", [])
+    if not records and "s3" in event:
+        records = [event]
+    for record in records:
+        s3_info = record["s3"]
+        objects.append(
+            {
+                "bucket": s3_info["bucket"]["name"],
+                "key": unquote_plus(s3_info["object"]["key"]),
+            }
+        )
+    return objects
+
+
 def read_json_from_s3(bucket: str, key: str) -> dict:
-    """
-    Read raw JSON from S3 using boto3 instead of awswrangler.
-    awswrangler.s3.read_json() fails on the Kaggle/YouTube category JSON
-    because it has mixed types (strings + nested arrays), which pandas
-    can't parse directly into a DataFrame.
-    """
     response = s3_client.get_object(Bucket=bucket, Key=key)
-    content = response["Body"].read().decode("utf-8")
-    return json.loads(content)
+    return json.loads(response["Body"].read().decode("utf-8"))
 
 
-def validate_category_data(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Validate and clean the category reference data.
-    Returns cleaned DataFrame or raises ValueError.
-    """
-    if df.empty:
-        raise ValueError("Empty DataFrame — no category items found")
+def region_from_key(key: str) -> str:
+    for part in key.split("/"):
+        if part.startswith("region="):
+            return part.partition("=")[2].lower()
+    raise ValueError(f"S3 key does not contain a region partition: {key}")
 
-    required_cols = {"id", "snippet.title"}
-    actual_cols = set(df.columns)
-    missing = required_cols - actual_cols
+
+def normalize_categories(raw_data: dict, region: str, source_key: str) -> pd.DataFrame:
+    items = raw_data.get("items")
+    if not isinstance(items, list) or not items:
+        raise ValueError("Category payload must contain a non-empty items array")
+    frame = pd.json_normalize(items)
+    required = {"id", "snippet.title"}
+    missing = required - set(frame.columns)
     if missing:
-        # Try alternate column names from different API versions
-        logger.warning(f"Missing expected columns: {missing}. Available: {actual_cols}")
+        raise ValueError(f"Category payload is missing columns: {sorted(missing)}")
 
-    # Drop duplicate categories (same id)
-    before = len(df)
-    if "id" in df.columns:
-        df = df.drop_duplicates(subset=["id"], keep="last")
-    after = len(df)
-    if before != after:
-        logger.info(f"  Removed {before - after} duplicate categories")
-
-    return df
+    frame = frame.drop_duplicates(subset=["id"], keep="last")
+    frame["id"] = pd.to_numeric(frame["id"], errors="raise").astype("int64")
+    frame["region"] = region
+    frame["_ingestion_timestamp"] = datetime.now(UTC)
+    frame["_source_file"] = source_key
+    return frame
 
 
-def send_alert(subject: str, message: str):
-    if SNS_TOPIC:
-        sns_client.publish(TopicArn=SNS_TOPIC, Subject=subject[:100], Message=message)
+def publish_alert(topic_arn: str, errors: list[dict]) -> None:
+    if topic_arn:
+        sns_client.publish(
+            TopicArn=topic_arn,
+            Subject="[YT Pipeline] Silver reference transform failed",
+            Message=json.dumps(errors, indent=2),
+        )
 
 
 def lambda_handler(event, context):
-    """Process S3 event for new JSON reference files."""
-
-    # Handle both direct S3 events and EventBridge-wrapped events
-    records = event.get("Records", [])
-    if not records:
-        # Could be invoked directly by Step Functions
-        records = [event] if "s3" in event else []
+    settings = config()
+    objects = extract_objects(event)
+    if not objects:
+        raise ValueError("No S3 reference objects were supplied")
 
     processed = []
     errors = []
-
-    for record in records:
+    for item in objects:
         try:
-            s3_info = record["s3"]
-            bucket = s3_info["bucket"]["name"]
-            key = unquote_plus(s3_info["object"]["key"])
-
-            logger.info(f"Processing: s3://{bucket}/{key}")
-
-            # ── Read raw JSON ────────────────────────────────────────────
-            # We use boto3 + json.loads instead of wr.s3.read_json() because
-            # the category JSON has mixed types (strings like "kind"/"etag"
-            # alongside a nested "items" array) which causes pandas to fail
-            # with: "Mixing dicts with non-Series may lead to ambiguous ordering"
-            raw_data = read_json_from_s3(bucket, key)
-
-            # The YouTube/Kaggle JSON has { "kind": "...", "items": [...] }
-            # We only care about the items array
-            if "items" in raw_data and isinstance(raw_data["items"], list):
-                df = pd.json_normalize(raw_data["items"])
-            else:
-                # Fallback: try to normalize the entire object
-                df = pd.json_normalize(raw_data)
-
-            logger.info(f"  Raw shape: {df.shape}")
-
-            # ── Validate ─────────────────────────────────────────────────
-            df = validate_category_data(df)
-
-            # ── Add metadata columns ─────────────────────────────────────
-            df["_ingestion_timestamp"] = datetime.now(timezone.utc).isoformat()
-            df["_source_file"] = key
-
-            # Extract region from the S3 key (e.g., region=US)
-            region = "unknown"
-            for part in key.split("/"):
-                if part.startswith("region="):
-                    region = part.split("=")[1]
-                    break
-            df["region"] = region
-
-            logger.info(f"  Clean shape: {df.shape}, region: {region}")
-
-            # ── Write to Silver layer as Parquet ─────────────────────────
-            wr_response = wr.s3.to_parquet(
-                df=df,
-                path=SILVER_PATH,
+            region = region_from_key(item["key"])
+            frame = normalize_categories(
+                read_json_from_s3(item["bucket"], item["key"]), region, item["key"]
+            )
+            wr.s3.to_parquet(
+                df=frame,
+                path=settings["path"],
                 dataset=True,
-                database=GLUE_DB,
-                table=GLUE_TABLE,
+                database=settings["database"],
+                table=settings["table"],
                 partition_cols=["region"],
-                mode="overwrite_partitions",  # Idempotent per region
+                mode="overwrite_partitions",
                 schema_evolution=True,
             )
+            processed.append({"key": item["key"], "region": region, "rows": len(frame)})
+        except Exception as exc:
+            logger.exception("Reference transform failed for key=%s", item.get("key"))
+            errors.append({"key": item.get("key", "unknown"), "error": str(exc)})
 
-            logger.info(f"  Written to Silver: {SILVER_PATH}")
-            processed.append({"key": key, "region": region, "rows": len(df)})
-
-        except Exception as e:
-            logger.error(f"Error processing record: {e}", exc_info=True)
-            errors.append({"key": key if "key" in dir() else "unknown", "error": str(e)})
-
-    # ── Summary ──────────────────────────────────────────────────────────
     if errors:
-        send_alert(
-            subject="[YT Pipeline] Silver reference transform failed",
-            message=json.dumps(errors, indent=2),
-        )
-
-    return {
-        "statusCode": 200,
-        "processed": processed,
-        "errors": errors,
-    }
+        publish_alert(settings["sns_topic"], errors)
+        raise RuntimeError(f"Reference transform failed for {len(errors)}/{len(objects)} objects")
+    return {"processed": processed, "processed_count": len(processed)}

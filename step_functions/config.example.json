@@ -1,0 +1,16 @@
+{
+  "INGESTION_LAMBDA_ARN": "arn:aws:lambda:us-east-1:111122223333:function:yt-data-pipeline-youtube-ingestion-dev",
+  "REFERENCE_LAMBDA_ARN": "arn:aws:lambda:us-east-1:111122223333:function:yt-data-pipeline-json-to-parquet-dev",
+  "DATA_QUALITY_LAMBDA_ARN": "arn:aws:lambda:us-east-1:111122223333:function:yt-data-pipeline-data-quality-dev",
+  "BRONZE_TO_SILVER_JOB": "yt-data-pipeline-bronze-to-silver-dev",
+  "SILVER_TO_GOLD_JOB": "yt-data-pipeline-silver-to-gold-dev",
+  "BRONZE_DATABASE": "yt_pipeline_bronze_dev",
+  "BRONZE_TABLE": "raw_statistics",
+  "SILVER_BUCKET": "replace-with-your-silver-bucket",
+  "SILVER_DATABASE": "yt_pipeline_silver_dev",
+  "SILVER_TABLE": "clean_statistics",
+  "REFERENCE_TABLE": "clean_reference_data",
+  "GOLD_BUCKET": "replace-with-your-gold-bucket",
+  "GOLD_DATABASE": "yt_pipeline_gold_dev",
+  "SNS_TOPIC_ARN": "arn:aws:sns:us-east-1:111122223333:yt-data-pipeline-alerts-dev"
+}

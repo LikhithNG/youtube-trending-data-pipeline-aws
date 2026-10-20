@@ -59,7 +59,7 @@ stats_dyf = glueContext.create_dynamic_frame.from_catalog(
 stats_df = stats_dyf.toDF()
 logger.info(f"Statistics records: {stats_df.count()}")
 
-# ── Read Reference Data (optional) + Build category lookup ───────────────────
+# ── Read Reference Data + Build region-aware category lookup ────────────────
 logger.info("Attempting to read Silver reference data for category names...")
 
 try:
@@ -72,18 +72,20 @@ try:
 
     category_lookup = None
 
-    # Some crawlers flatten nested fields in different ways; handle common cases
+    # Category IDs can vary by locale, so region is part of the lookup key.
     if "id" in ref_df.columns and "snippet.title" in ref_df.columns:
         category_lookup = ref_df.select(
             F.col("id").cast("long").alias("category_id"),
+            F.lower(F.col("region")).alias("region"),
             F.col("`snippet.title`").alias("category_name"),
-        ).dropDuplicates(["category_id"])
+        ).dropDuplicates(["category_id", "region"])
 
     elif "id" in ref_df.columns and "snippet_title" in ref_df.columns:
         category_lookup = ref_df.select(
             F.col("id").cast("long").alias("category_id"),
+            F.lower(F.col("region")).alias("region"),
             F.col("snippet_title").alias("category_name"),
-        ).dropDuplicates(["category_id"])
+        ).dropDuplicates(["category_id", "region"])
 
     else:
         logger.warn(
@@ -98,14 +100,12 @@ try:
         if "category_id" in stats_df.columns:
             stats_df = stats_df.withColumn("category_id", F.col("category_id").cast("long"))
 
-        stats_df = stats_df.join(
-            F.broadcast(category_lookup),
-            on="category_id",
-            how="left",
-        )
+        stats_df = stats_df.withColumn("region", F.lower(F.col("region")))
+        stats_df = stats_df.join(F.broadcast(category_lookup), on=["category_id", "region"], how="left")
 
 except Exception as e:
-    logger.warn(f"Could not load reference data: {e}. Proceeding without category names.")
+    logger.error(f"Could not load required reference data: {e}")
+    raise
 
 # ✅ Always guarantee category_name exists
 if "category_name" not in stats_df.columns:
@@ -135,6 +135,8 @@ trending = stats_df.groupBy("region", "trending_date_parsed").agg(
 trending = trending.withColumn("_aggregated_at", F.current_timestamp())
 
 trending_path = f"s3://{GOLD_BUCKET}/youtube/trending_analytics/"
+# Gold tables are full snapshots. Purging before each write makes reruns idempotent.
+glueContext.purge_s3_path(trending_path, options={"retentionPeriod": 0})
 trending_dyf = DynamicFrame.fromDF(trending, glueContext, "trending")
 
 sink1 = glueContext.getSink(
@@ -162,7 +164,7 @@ channel = stats_df.groupBy("channel_title", "region").agg(
     F.avg("views").alias("avg_views_per_video"),
     F.avg("engagement_rate").alias("avg_engagement_rate"),
     F.max("views").alias("peak_views"),
-    F.count("trending_date_parsed").alias("times_trending"),
+    F.countDistinct("trending_date_parsed").alias("times_trending"),
     F.min("trending_date_parsed").alias("first_trending"),
     F.max("trending_date_parsed").alias("last_trending"),
     F.collect_set("category_name").alias("categories"),
@@ -174,6 +176,7 @@ channel = channel.withColumn("rank_in_region", F.row_number().over(window_rank))
 channel = channel.withColumn("_aggregated_at", F.current_timestamp())
 
 channel_path = f"s3://{GOLD_BUCKET}/youtube/channel_analytics/"
+glueContext.purge_s3_path(channel_path, options={"retentionPeriod": 0})
 channel_dyf = DynamicFrame.fromDF(channel, glueContext, "channel")
 
 sink2 = glueContext.getSink(
@@ -211,6 +214,7 @@ category = category.withColumn(
 category = category.withColumn("_aggregated_at", F.current_timestamp())
 
 category_path = f"s3://{GOLD_BUCKET}/youtube/category_analytics/"
+glueContext.purge_s3_path(category_path, options={"retentionPeriod": 0})
 category_dyf = DynamicFrame.fromDF(category, glueContext, "category")
 
 sink3 = glueContext.getSink(
