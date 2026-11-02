@@ -1,3 +1,19 @@
+<!-- themed-header:start -->
+<a href="https://likhith-ng-portfolio.vercel.app/#proj-youtube"><img src="docs/readme/hero.svg" width="100%" alt="YouTube Trending Data Pipeline on AWS: Built a medallion pipeline on AWS that pulls live YouTube trending data for 10 regions and refines it into Bronze, Silver and Gold tables with PySpark on Glue."></a>
+
+<p align="center">
+  <a href="https://likhith-ng-portfolio.vercel.app/#proj-youtube"><img alt="See it on my portfolio" src="https://img.shields.io/badge/see%20it%20on-my%20portfolio-a5a1f0?style=for-the-badge&labelColor=1d1e23"></a>
+  <a href="https://github.com/LikhithNG"><img alt="More of my work" src="https://img.shields.io/badge/more%20of%20my%20work-github.com%2FLikhithNG-5eead4?style=for-the-badge&labelColor=1d1e23"></a>
+</p>
+
+**At a glance**
+
+- Built a medallion pipeline on AWS that pulls live YouTube trending data for 10 regions and refines it into Bronze, Silver and Gold tables with PySpark on Glue.
+- Orchestrated the steps with Step Functions, adding retries, SNS alerts and a 5-check data-quality gate that stops bad data before three idempotent Athena tables are built.
+
+---
+<!-- themed-header:end -->
+
 # YouTube Trending Data Pipeline on AWS
 
 An end-to-end data engineering project that ingests live YouTube trending data for ten regions, processes it through Bronze, Silver, and Gold layers, applies a blocking data-quality gate, and exposes analytics tables through the AWS Glue Data Catalog and Athena.
